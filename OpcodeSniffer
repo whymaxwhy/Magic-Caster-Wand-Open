@@ -1,0 +1,20 @@
+python wand_controller.py --test-opcodes
+
+This will systematically write single-byte values (`0x01`, `0x02`, `0x03`, etc.) to the **WRITE_UUID** (`57420002...`). When the wand buzzes or flashes a light, you've found a working OpCode. You will need to replace the placeholders (`0xAA`, `0xBB`, `0xCC`) in the `MacroStruct` classes with these discovered values.
+
+
+
+### B. Compiling the Spell Dictionary
+
+**Action:** Run the data logger and cast every known spell:
+
+```bash
+python wand_data_logger.py
+
+The output from the **NOTIFY_UUID** (`57420003...`) will contain the ASCII spell name, but you need the **full hex string** to have the complete dictionary.
+
+### C. Finding Raw Motion Data (Optional but Recommended)
+
+**Action:** Run the data logger and move the wand without casting a spell.
+
+If the wand sends raw motion data, a **second, unknown UUID** will rapidly start printing hex data. Identifying this UUID will unlock the ability to code custom gestures and spells.
