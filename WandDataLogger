@@ -1,0 +1,84 @@
+import asyncio
+from bleak import BleakScanner, BleakClient
+
+# Define UUIDs we typically don't log (Service Changed is noisy)
+# Note: Battery Level (2a19) is kept in, as it's useful data
+PROBLEMATIC_UUIDS = {
+    "00002a05-0000-1000-8000-00805f9b34fb", # Service Changed
+}
+
+async def notification_handler(sender, data):
+    """Callback for all notifications and indications."""
+    # Print the UUID (sender) and the raw hex payload for analysis
+    print(f"📩 [{sender}]: {data.hex()}")
+
+async def main():
+    print("🔍 Searching for wand (name starting with 'MCW')...")
+    wand = None
+    devices = await BleakScanner.discover(timeout=10)
+
+    for d in devices:
+        if d.name and "MCW" in d.name:
+            wand = d
+            break
+
+    if not wand:
+        print("❌ Wand not found. Ensure it is awake and advertising.")
+        return
+
+    print(f"✨ Wand found: {wand.name} ({wand.address})")
+    print("🔗 Connecting...")
+
+    try:
+        async with BleakClient(wand.address) as client:
+            if not client.is_connected:
+                print("❌ Connection failed.")
+                return
+
+            print("✅ Connection successful!")
+            print("📦 Scanning services for NOTIFY/INDICATE characteristics...")
+
+            services = await client.get_services()
+            notify_chars = []
+            
+            for service in services:
+                for char in service.characteristics:
+                    props = char.properties
+                    # Filter for only characteristics that can push data to us
+                    if ("notify" in props or "indicate" in props) and char.uuid not in PROBLEMATIC_UUIDS:
+                        notify_chars.append(char)
+                        
+            print(f"Found {len(notify_chars)} characteristics to subscribe to.")
+            
+            # Subscribe to all found characteristics
+            for char in notify_chars:
+                try:
+                    await client.start_notify(char.uuid, notification_handler)
+                    print(f"🚀 Notification started: {char.uuid}")
+                except Exception as e:
+                    print(f"⚠️ Notification could not start: {char.uuid} ({e})")
+
+            print("\n🎯 LISTENING... Move the wand and cast spells to generate data.")
+            print("   (Exit with Ctrl+C to close connection)")
+
+            try:
+                # Keep the connection alive while listening
+                while client.is_connected:
+                    await asyncio.sleep(1)
+            except KeyboardInterrupt:
+                pass
+            finally:
+                # Clean up subscriptions
+                print("Stopping notifications and closing connection...")
+                for char in notify_chars:
+                    try:
+                        if client.is_connected:
+                            await client.stop_notify(char.uuid)
+                    except:
+                        pass
+                print("🔌 Connection closed.")
+    except Exception as e:
+        print(f"An error occurred during BLE operations: {e}")
+
+if __name__ == "__main__":
+    asyncio.run(main())
