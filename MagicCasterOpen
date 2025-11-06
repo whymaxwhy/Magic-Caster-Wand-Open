@@ -1,0 +1,257 @@
+import asyncio
+import sys
+from bleak import BleakClient, BleakScanner, BleakError
+from typing import Optional, Callable, List
+
+# --- Configuration: Standardized UUIDs ---
+class WandGatt:
+    """Contains the known, confirmed UUIDs for the Harry Potter Wand BLE service."""
+    
+    TARGET_NAME = "MCW" # Used to scan for any wand device (e.g., MCW-7DFE)
+    
+    # WRITE Characteristic (VFX/Command Bus) - Used to send commands TO the wand
+    WRITE_UUID = "57420002-587e-48a0-974c-544d6163c577" 
+    
+    # NOTIFY Characteristic (Spell/Data Bus) - Used to receive spells FROM the wand
+    NOTIFY_UUID = "57420003-587e-48a0-974c-544d6163c577"
+    
+    # Standard Keep-Alive
+    KEEPALIVE_INTERVAL = 5.0 # seconds 
+    KEEPALIVE_COMMAND = bytes([0x01]) 
+    
+    # Spell Decoding Constants (Based on confirmed 4-byte header skip)
+    SPELL_DATA_HEADER_LEN = 4 
+    SPELL_MIN_LEN = SPELL_DATA_HEADER_LEN + 3 # Needs at least 3 chars for a spell name
+    
+    # BLE Packet Size limit for chunking commands
+    MTU_PAYLOAD_SIZE = 20 
+
+# --- Macro Command Structs (CRITICAL: OpCodes are HYPOTHETICAL) ---
+# NOTE: These are PLACEHOLDERS. Finding the correct OpCode byte (the first byte) 
+# is the final step in protocol discovery. Use the --test-opcodes mode to find them!
+
+class MacroStruct:
+    """Base class for all wand command structures."""
+    def get_bytes(self) -> bytes:
+        raise NotImplementedError("Subclasses must define their command byte payload.")
+
+class ClearLeds(MacroStruct):
+    OPCODE = 0xAA # <--- PLACEHOLDER! NEEDS DISCOVERY.
+    def get_bytes(self) -> bytes:
+        """Sends a command to clear the LEDs instantly."""
+        return bytes([self.OPCODE])
+
+class Buzz(MacroStruct):
+    OPCODE = 0xBB # <--- PLACEHOLDER! NEEDS DISCOVERY.
+    def __init__(self, duration_ms: int):
+        self.duration = min(duration_ms, 32767) 
+
+    def get_bytes(self) -> bytes:
+        """OpCode (1 byte) + Duration (2 bytes, little-endian)."""
+        duration_bytes = self.duration.to_bytes(2, 'little')
+        return bytes([self.OPCODE]) + duration_bytes
+
+class ChangeLed(MacroStruct):
+    OPCODE = 0xCC # <--- PLACEHOLDER! NEEDS DISCOVERY.
+    def __init__(self, group_id: int, hex_color: str, duration_ms: int):
+        """
+        group_id: 0 typically means all LEDs.
+        hex_color: e.g., "FF0000" for Red.
+        """
+        self.group = group_id
+        self.duration = min(duration_ms, 32767)
+        self.rgb_bytes = bytes.fromhex(hex_color.lstrip('#'))
+
+    def get_bytes(self) -> bytes:
+        """OpCode + Group Byte + 3 RGB Bytes + 2-byte duration."""
+        duration_bytes = self.duration.to_bytes(2, 'little')
+        return bytes([self.OPCODE, self.group]) + self.rgb_bytes + duration_bytes
+
+# --- Core Wand Controller Logic ---
+class WandController:
+    
+    def __init__(self, target_name: str = WandGatt.TARGET_NAME):
+        self.target_name = target_name
+        self.client: Optional[BleakClient] = None
+        self.keep_alive_task: Optional[asyncio.Task] = None
+
+    def _default_spell_handler(self, sender: str, data: bytearray):
+        """Processes incoming spell/motion data using the confirmed decoding method."""
+        raw_hex = data.hex()
+        
+        if len(data) >= WandGatt.SPELL_MIN_LEN:
+            # Skip the 4-byte header confirmed by community findings
+            spell_bytes = data[WandGatt.SPELL_DATA_HEADER_LEN:]
+            try:
+                spell_name = spell_bytes.decode('ascii').strip()
+                if spell_name:
+                    print(f"\n✨ **SPELL DETECTED:** ***{spell_name.upper()}***")
+                    print(f"   RAW Hex: {raw_hex}")
+                    return
+            except UnicodeDecodeError:
+                pass 
+                
+        # If not a recognized spell, log as raw data for analysis
+        print(f"🪄 RAW Notification (Motion/Unknown) [{sender}]: {raw_hex}")
+
+    async def _keep_alive(self):
+        """Sends a periodic command to the WRITE_UUID to prevent disconnect."""
+        while self.client and self.client.is_connected:
+            try:
+                await self.client.write_gatt_char(
+                    WandGatt.WRITE_UUID, 
+                    WandGatt.KEEPALIVE_COMMAND, 
+                    response=False
+                )
+            except Exception:
+                break 
+            await asyncio.sleep(WandGatt.KEEPALIVE_INTERVAL)
+        
+    async def connect(self) -> bool:
+        """Scans, connects, and sets up subscriptions/keep-alive."""
+        print(f"Scanning for target device: {self.target_name}...")
+        device = await BleakScanner.find_device_by_name(self.target_name, timeout=10.0)
+        if not device:
+            print(f"❌ Device {self.target_name} not found.")
+            return False
+        
+        self.client = BleakClient(device.address)
+        try:
+            await self.client.connect()
+            if not self.client.is_connected: return False
+
+            # Subscribe to the critical spell bus
+            await self.client.start_notify(WandGatt.NOTIFY_UUID, self._default_spell_handler)
+            
+            self.keep_alive_task = asyncio.create_task(self._keep_alive())
+            print(f"✅ Connected to {device.name}. Wand is LIVE.")
+            return True
+        
+        except BleakError as e:
+            print(f"❌ Connection Error: {e}")
+            return False
+
+    async def disconnect(self):
+        """Stops tasks and disconnects the client."""
+        if self.keep_alive_task: self.keep_alive_task.cancel()
+        if self.client and self.client.is_connected: 
+            await self.client.disconnect()
+        self.client = None
+
+    async def send_macro_message(self, command_structs: List[MacroStruct]):
+        """
+        Sends a sequence of MacroStructs, correctly chunking them into 20-byte packets 
+        based on the standard BLE MTU size.
+        """
+        if not self.client or not self.client.is_connected:
+            print("❌ Cannot send macro. Not connected.")
+            return
+
+        macro_messages = []
+        current_chunk = bytearray()
+        MAX_PAYLOAD_SIZE = WandGatt.MTU_PAYLOAD_SIZE 
+
+        # Assemble chunks
+        for struct in command_structs:
+            struct_bytes = struct.get_bytes()
+            if len(current_chunk) + len(struct_bytes) > MAX_PAYLOAD_SIZE:
+                macro_messages.append(bytes(current_chunk))
+                current_chunk = bytearray()
+            current_chunk.extend(struct_bytes)
+
+        if len(current_chunk) > 0:
+            macro_messages.append(bytes(current_chunk))
+
+        print(f"📡 Sending macro ({len(macro_messages)} packets) to WRITE_UUID...")
+        
+        # Write each chunk
+        for chunk in macro_messages:
+            await self.client.write_gatt_char(WandGatt.WRITE_UUID, chunk, response=False)
+            await asyncio.sleep(0.01) 
+        print("✅ Macro message sent.")
+
+# --- OpCode Discovery Tool (Dedicated Test Function) ---
+
+async def opcode_test_mode(controller: WandController):
+    """
+    Dedicated loop for systematically testing single-byte OpCodes to discover 
+    the Buzz, LED, and Clear commands.
+    """
+    if not await controller.connect():
+        print("OpCode Test Mode failed to connect.")
+        return
+
+    opcode_to_test = 0x01  # Start testing at OpCode 0x01
+    
+    print("\n*************************************************************")
+    print("*** OpCode Discovery Mode Active (WAND WILL REACT IF FOUND) ***")
+    print("*************************************************************")
+
+    while controller.client and controller.client.is_connected and opcode_to_test < 0xFF:
+        
+        print(f"\n-> TESTING OPCODE 0x{opcode_to_test:02x}")
+        
+        # The simplest possible command is just the OpCode byte
+        test_payload = bytes([opcode_to_test])
+
+        try:
+            await controller.client.write_gatt_char(
+                WandGatt.WRITE_UUID, 
+                test_payload, 
+                response=False
+            )
+            print("    ... Write success. Did the wand buzz, light up, or react?")
+        except Exception as e:
+            print(f"    ... Write failed (harmless for this test): {e}")
+
+        # Wait for user observation (and prevent rate-limiting)
+        input_value = await asyncio.to_thread(input, "Press ENTER to continue to next OpCode, or type 'quit': ")
+        
+        if input_value.lower() == 'quit':
+            break
+        
+        opcode_to_test += 1 
+
+    print("OpCode testing finished or disconnected.")
+    await controller.disconnect()
+    
+# --- Main Application Execution ---
+async def application_loop():
+    controller = WandController()
+    
+    # Check if the user is running the OpCode test mode
+    if '--test-opcodes' in sys.argv:
+        return await opcode_test_mode(controller)
+
+    # Standard Controller Mode
+    TEST_VFX_MACRO = [
+        ChangeLed(group_id=0, hex_color="0000FF", duration_ms=500), # Blue light
+        Buzz(duration_ms=250), 
+        ClearLeds() 
+    ]
+    
+    while True:
+        if await controller.connect():
+            try:
+                print("\n** STANDARD CONTROLLER READY **")
+                print("  - Type 'test' to send a sample macro.")
+                print("  - Type 'quit' to exit.")
+                print("*******************************")
+                
+                while controller.client and controller.client.is_connected:
+                    user_input = await asyncio.to_thread(input)
+                    if user_input.lower() == 'quit': break
+                    if user_input.lower() == 'test':
+                        await controller.send_macro_message(TEST_VFX_MACRO)
+                        print("NOTE: Macro will only work once OpCodes (0xAA, 0xBB, 0xCC) are fixed!")
+            finally:
+                await controller.disconnect()
+                await asyncio.sleep(5) 
+        else:
+            await asyncio.sleep(5)
+            
+if __name__ == "__main__":
+    try:
+        asyncio.run(application_loop())
+    except KeyboardInterrupt:
+        print("\nProgram shut down.")
